@@ -1,20 +1,22 @@
 use std::collections::HashMap;
 
-use authentik::{configure_authentik_users, AuthentikConfig};
+use crate::services::authentik::AuthentikConfig;
+use crate::services::gitlab::GitLabConfig;
+use crate::services::keycloak::KeycloakConfig;
+use crate::services::Service;
 use clap::Parser;
-use gitlab::configure_gitlab;
-use keycloak::{configure_keycloak_users, KeycloakConfig};
-use matrix::configure_matrix;
+use nextcloud_table::Nextcloud;
+use serde::{Deserialize, Serialize};
 use serde_with::skip_serializing_none;
 use tokio;
 
-mod authentik;
-mod gitlab;
-mod keycloak;
-mod matrix;
+mod nextcloud_table;
+mod services;
+
 fn true_bool() -> bool {
     true
 }
+
 fn false_bool() -> bool {
     false
 }
@@ -23,27 +25,32 @@ fn false_bool() -> bool {
 #[command(
     version,
     author = "Florian Schubert",
-    about = "Program um die Benutzer der Fachschaft Informatik zu verwalten",
+    about = "Program um die Benutzer:innen im AStA zu verwalten.",
     name = "benutzerverwaltungstool",
     color = clap::ColorChoice::Always
 )]
 struct Args {
     #[clap(short, long)]
     config: String,
-    #[clap(short, long)]
-    users: String,
 }
 
-#[derive(serde::Deserialize, serde::Serialize, Debug)]
+#[derive(Deserialize, Serialize, Debug)]
 struct Config {
+    users_provider: UserConfigProvider,
     keycloak: Option<KeycloakConfig>,
     authentik: Option<AuthentikConfig>,
-    gitlab: Option<gitlab::GitLabConfig>,
-    matrix: Option<matrix::MatrixConfig>,
+    gitlab: Option<GitLabConfig>,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum UserConfigProvider {
+    File(String),
+    NextcloudTable { nextcloud: Nextcloud, table_id: u64 },
 }
 
 #[skip_serializing_none]
-#[derive(serde::Deserialize, serde::Serialize, Debug)]
+#[derive(Deserialize, Serialize, Debug)]
 pub(crate) struct UserConfig {
     first_name: Option<String>,
     last_name: Option<String>,
@@ -65,23 +72,24 @@ async fn main() -> anyhow::Result<()> {
     let config = std::fs::read_to_string(args.config)?;
     let config: Config = serde_json::from_str(&config)?;
 
-    let user_configs = std::fs::read_to_string(args.users)?;
-    let user_configs: HashMap<String, UserConfig> = serde_json::from_str(&user_configs)?;
+    let user_configs: HashMap<String, UserConfig> = match config.users_provider {
+        UserConfigProvider::NextcloudTable {
+            nextcloud,
+            table_id,
+        } => nextcloud_table::get_user_configs(&nextcloud, table_id).await?,
+        UserConfigProvider::File(path) => serde_json::from_str(&std::fs::read_to_string(path)?)?,
+    };
 
     if let Some(keycloak_config) = &config.keycloak {
-        configure_keycloak_users(&user_configs, &keycloak_config).await?;
+        keycloak_config.configure(&user_configs).await?;
     }
 
     if let Some(authentik_config) = &config.authentik {
-        configure_authentik_users(&user_configs, &authentik_config).await?;
+        authentik_config.configure(&user_configs).await?;
     }
 
     if let Some(gitlab_config) = &config.gitlab {
-        configure_gitlab(&user_configs, gitlab_config).await?;
-    }
-
-    if let Some(matrix_config) = &config.matrix {
-        configure_matrix(&user_configs, matrix_config).await?;
+        gitlab_config.configure(&user_configs).await?;
     }
 
     Ok(())

@@ -1,13 +1,14 @@
 use std::collections::HashMap;
 
+use log::*;
 use oauth2::basic::BasicClient;
 use oauth2::reqwest::async_http_client;
 use oauth2::AccessToken;
 use oauth2::ClientId;
 use oauth2::TokenResponse;
-use log::*;
 use serde_json::json;
 
+use crate::services::Service;
 use crate::true_bool;
 use crate::UserConfig;
 
@@ -19,7 +20,6 @@ pub struct KeycloakConfig {
     pub password: String,
     pub client_id: String,
 }
-
 
 #[derive(serde::Deserialize, serde::Serialize, Debug)]
 struct KeycloakUser {
@@ -45,37 +45,42 @@ struct KeycloakRole {
     name: String,
 }
 
-pub async fn configure_keycloak_users(users: &HashMap<String, UserConfig>, keycloak_config: &KeycloakConfig) -> anyhow::Result<()> {
-    let client = KeycloakClient::new(
-        keycloak_config.url.clone(),
-        keycloak_config.realm.clone(),
-        keycloak_config.username.clone(),
-        keycloak_config.password.clone(),
-        keycloak_config.client_id.clone(),
-    ).await?;
+impl Service for KeycloakConfig {
+    async fn configure(&self, users: &HashMap<String, UserConfig>) -> anyhow::Result<()> {
+        let client = KeycloakClient::new(
+            self.url.clone(),
+            self.realm.clone(),
+            self.username.clone(),
+            self.password.clone(),
+            self.client_id.clone(),
+        )
+        .await?;
 
-    let keycloak_users = client.get_all_users().await?;
+        let keycloak_users = client.get_all_users().await?;
 
-    let users_to_create = users.iter()
-        .filter(|user| !keycloak_users.iter().any(|k| *user.0 == k.username))
-        .collect::<HashMap<_, _>>();
+        let users_to_create = users
+            .iter()
+            .filter(|user| !keycloak_users.iter().any(|k| *user.0 == k.username))
+            .collect::<HashMap<_, _>>();
 
-    client.create_users(&users_to_create).await?;
+        client.create_users(&users_to_create).await?;
 
+        let users_to_update = keycloak_users
+            .iter()
+            .filter(|keycloak_user| users.contains_key(&keycloak_user.username))
+            .collect::<Vec<_>>();
 
-    let users_to_update = keycloak_users.iter().filter(|keycloak_user| {
-        users.contains_key(&keycloak_user.username)
-    }).collect::<Vec<_>>();
+        client.update_users(&users_to_update, &users).await?;
+        client.update_roles(&users_to_update, &users).await?;
 
-    client.update_users(&users_to_update, &users).await?;
-    client.update_roles(&users_to_update, &users).await?;
+        let users_to_delete = keycloak_users
+            .iter()
+            .filter(|keycloak_user| !users.contains_key(&keycloak_user.username))
+            .collect::<Vec<_>>();
+        client.delete_users(&users_to_delete).await?;
 
-    let users_to_delete = keycloak_users.iter().filter(|keycloak_user| {
-        !users.contains_key(&keycloak_user.username)
-    }).collect::<Vec<_>>();
-    client.delete_users(&users_to_delete).await?;
-
-    Ok(())
+        Ok(())
+    }
 }
 
 impl KeycloakClient {
@@ -84,7 +89,7 @@ impl KeycloakClient {
         realm: String,
         user: String,
         password: String,
-        client_id: String
+        client_id: String,
     ) -> anyhow::Result<Self> {
         let oauth_client = BasicClient::new(
             ClientId::new(client_id),
@@ -121,10 +126,7 @@ impl KeycloakClient {
         })
     }
 
-    async fn create_users(
-        &self,
-        users: &HashMap<&String, &UserConfig>,
-    ) -> anyhow::Result<()> {
+    async fn create_users(&self, users: &HashMap<&String, &UserConfig>) -> anyhow::Result<()> {
         for user in users {
             let user = self
                 .reqwest_client
@@ -152,7 +154,7 @@ impl KeycloakClient {
     }
 
     async fn get_all_users(&self) -> anyhow::Result<Vec<KeycloakUser>> {
-        info!("Getting all users from Keycloak");
+        debug!("Getting all users from Keycloak");
         // Create a request
         Ok(self
             .reqwest_client
@@ -169,7 +171,7 @@ impl KeycloakClient {
 
     async fn disable_users(&self, users: &Vec<&KeycloakUser>) -> anyhow::Result<()> {
         for user in users {
-            info!("Disabling user: {}", user.username);
+            debug!("Disabling user: {}", user.username);
             let _ = self
                 .reqwest_client
                 .put(format!(
@@ -206,7 +208,7 @@ impl KeycloakClient {
     }
 
     async fn get_all_realm_roles(&self) -> anyhow::Result<Vec<KeycloakRole>> {
-        info!("Getting all realm roles from Keycloak");
+        debug!("Getting all realm roles from Keycloak");
         Ok(self
             .reqwest_client
             .get(format!(
@@ -221,7 +223,7 @@ impl KeycloakClient {
     }
 
     async fn get_realm_roles(&self, user: &KeycloakUser) -> anyhow::Result<Vec<KeycloakRole>> {
-        info!("Getting realm roles for user: {}", user.username);
+        debug!("Getting realm roles for user: {}", user.username);
         Ok(self
             .reqwest_client
             .get(format!(
@@ -233,6 +235,19 @@ impl KeycloakClient {
             .await?
             .json::<Vec<KeycloakRole>>()
             .await?)
+    }
+
+    async fn create_realm_role(&self, role: String) -> anyhow::Result<()> {
+        self.reqwest_client
+            .post(format!(
+                "{}/admin/realms/{}/roles",
+                self.base_url, self.realm
+            ))
+            .bearer_auth(self.token.secret())
+            .json(&json!({ "name": role }))
+            .send()
+            .await?;
+        Ok(())
     }
 
     fn roles_to_add(
@@ -248,7 +263,10 @@ impl KeycloakClient {
             .collect()
     }
 
-    fn roles_to_remove(config_roles: &Vec<String>, keycloak_roles: &Vec<KeycloakRole>) -> Vec<KeycloakRole> {
+    fn roles_to_remove(
+        config_roles: &Vec<String>,
+        keycloak_roles: &Vec<KeycloakRole>,
+    ) -> Vec<KeycloakRole> {
         keycloak_roles
             .iter()
             .filter(|role| !config_roles.contains(&role.name))
@@ -261,8 +279,19 @@ impl KeycloakClient {
         users_keycloak: &Vec<&KeycloakUser>,
         user_configs: &HashMap<String, UserConfig>,
     ) -> anyhow::Result<()> {
-        info!("Updating roles for users");
+        debug!("Updating roles for users");
         let keycloak_roles = self.get_all_realm_roles().await?;
+        for roles_to_add in user_configs
+            .iter()
+            .map(|(_, users)| users.roles.clone())
+            .flatten()
+            .filter(|r| !keycloak_roles.iter().any(|kr| kr.name == *r))
+        {
+            info!("Create role {}", roles_to_add);
+            self.create_realm_role(roles_to_add).await?;
+        }
+        let keycloak_roles = self.get_all_realm_roles().await?;
+
         for user in users_keycloak {
             let configured_roles = user_configs[&user.username].roles.clone();
             let existing_roles = self.get_realm_roles(user).await?;
@@ -282,7 +311,7 @@ impl KeycloakClient {
         roles_to_add: &Vec<KeycloakRole>,
         roles_to_remove: &Vec<KeycloakRole>,
     ) -> anyhow::Result<()> {
-        info!("Updating roles for user: {}", user_id);
+        debug!("Updating roles for user: {}", user_id);
         if !roles_to_add.is_empty() {
             match self
                 .reqwest_client

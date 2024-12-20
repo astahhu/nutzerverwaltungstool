@@ -70,6 +70,7 @@
             pkgs."${cargoToml.package.name}"
           ];
           buildInputs = with pkgs; [
+            sqlite
             rustfmt
             nixpkgs-fmt
           ];

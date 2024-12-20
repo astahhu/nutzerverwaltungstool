@@ -1,6 +1,10 @@
-# Keycloak User
-This is a simple user management application for Keycloak. It allows you to configure users and their roles in a file.
-This Application will then create/update the users and assign them the roles in Keycloak. It will also delete/disable users that are not in the configuration file.
+# Nutzerveraltungstool
+This tool setups users in Keycloak and other Platforms. It will automatically delete/disalbe Users that are no longer in the Configuration.
+
+This Tool accepts as User Configuration, the following forms:
+
+1. A Configuration file
+2. A Nextcloud Table with Configurable Fields.
 
 ## Usage
 ### Configuration
